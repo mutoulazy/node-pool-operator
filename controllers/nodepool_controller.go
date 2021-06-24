@@ -18,8 +18,18 @@ package controllers
 
 import (
 	"context"
+	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/api/node/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,7 +42,9 @@ import (
 // NodePoolReconciler reconciles a NodePool object
 type NodePoolReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 const nodeFinalizer = "node.finalizers.node-pool.lailin.xyz"
@@ -88,13 +100,26 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	if len(nodes.Items) > 0 {
 		log.Info("find nodes, will merge data", "nodes", len(nodes.Items))
+		pool.Status.Allocatable = v1.ResourceList{}
+		pool.Status.NodeCount = len(nodes.Items)
 		for _, node := range nodes.Items {
 			node := node
+			// 更新节点label和污点信息
 			//err := r.Patch(ctx, pool.Spec.ApplyNode(node), client.Merge)
 			err := r.Update(ctx, pool.Spec.ApplyNode(node))
 			if err != nil {
 				log.Info("Update Node Labels Error")
 				return ctrl.Result{}, err
+			}
+
+			for name, quantity := range node.Status.Allocatable {
+				q, ok := pool.Status.Allocatable[name]
+				if ok {
+					q.Add(quantity)
+					pool.Status.Allocatable[name] = q
+					continue
+				}
+				pool.Status.Allocatable[name] = quantity
 			}
 		}
 	}
@@ -127,14 +152,74 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// 产生事件
+	r.Recorder.Event(pool, v1.EventTypeNormal, "Update", "Update Status~~~")
+
+	pool.Status.StatusCode = 200
+	err = r.Status().Update(ctx, pool)
+	if err != nil {
+		log.Info("Update Status Error")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// 监听 Node 对象的更新事件，如果存在和 NodePool 关联的 node 对象更新就把对应的 NodePool 入队
 func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&nodesv1.NodePool{}).
+		Watches(&source.Kind{Type: &v1.Node{}}, handler.Funcs{UpdateFunc: r.nodeUpdateHandler}).
 		Complete(r)
+}
+
+// 节点标签更新处理
+func (r *NodePoolReconciler) nodeUpdateHandler(e event.UpdateEvent, q workqueue.RateLimitingInterface) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	oldPool, err := r.getNodePoolByLabels(ctx, e.ObjectOld.GetLabels())
+	if err != nil {
+		r.Log.Error(err, "get old node pool err")
+	}
+	if oldPool != nil {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: oldPool.Name},
+		})
+	}
+
+	newPool, err := r.getNodePoolByLabels(ctx, e.ObjectNew.GetLabels())
+	if err != nil {
+		r.Log.Error(err, "get new node pool err")
+	}
+	if newPool != nil {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: newPool.Name},
+		})
+	}
+}
+
+// 根据Label选取NodePool对象
+func (r *NodePoolReconciler) getNodePoolByLabels(ctx context.Context, labels map[string]string) (*nodesv1.NodePool, error) {
+	pool := &nodesv1.NodePool{}
+	for k := range labels {
+		splitK := strings.Split(k, "node-role.kubernetes.io/")
+		if len(splitK) != 2 {
+			continue
+		}
+		err := r.Get(ctx, types.NamespacedName{Name: splitK[1]}, pool)
+		if err == nil {
+			return pool, nil
+		}
+
+		if client.IgnoreNotFound(err) != nil {
+			r.Log.Error(err, "get node pool by labels err")
+			return nil, err
+		}
+	}
+
+	return nil, nil
 }
 
 // 节点预删除逻辑

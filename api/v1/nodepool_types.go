@@ -98,8 +98,19 @@ func (s *NodePoolSpec) CleanNode(node v1.Node) *v1.Node {
 type NodePoolStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// status=200 说明正常，其他情况为异常情况
+	StatusCode int `json:"statusCode"`
+
+	// 节点的数量
+	NodeCount int `json:"nodeCount"`
+
+	// 允许被调度的容量
+	Allocatable v1.ResourceList `json:"allocatable,omitempty" protobuf:"bytes,2,rep,name=allocatable,casttype=ResourceList,castkey=ResourceName"`
 }
 
+//+kubebuilder:printcolumn:JSONPath=".status.statusCode",name=Status,type=integer
+//+kubebuilder:printcolumn:JSONPath=".status.nodeCount",name=NodeCount,type=integer
 //+kubebuilder:object:root=true
 //+kubebuilder:resource:scope=Cluster
 //+kubebuilder:subresource:status
