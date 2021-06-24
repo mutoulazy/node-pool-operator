@@ -74,6 +74,26 @@ func (s *NodePoolSpec) ApplyNode(node v1.Node) *v1.Node {
 	return &node
 }
 
+// CleanNode 清理节点标签污点信息，仅保留系统标签
+func (s *NodePoolSpec) CleanNode(node v1.Node) *v1.Node {
+	var keyReg = regexp.MustCompile(`^node-pool.lailin.xyz/*[a-zA-z0-9]*$`)
+	// 清除NodePool添加的标签
+	for k := range s.Labels {
+		delete(node.Labels, k)
+	}
+
+	// 清楚污点标签
+	var taints []v1.Taint
+	for _, taint := range node.Spec.Taints {
+		// 过滤
+		if !keyReg.MatchString(taint.Key) {
+			taints = append(taints, taint)
+		}
+	}
+	node.Spec.Taints = taints
+	return &node
+}
+
 // NodePoolStatus defines the observed state of NodePool
 type NodePoolStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -81,6 +101,7 @@ type NodePoolStatus struct {
 }
 
 //+kubebuilder:object:root=true
+//+kubebuilder:resource:scope=Cluster
 //+kubebuilder:subresource:status
 
 // NodePool is the Schema for the nodepools API

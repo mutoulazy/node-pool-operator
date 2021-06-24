@@ -35,6 +35,8 @@ type NodePoolReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+const nodeFinalizer = "node.finalizers.node-pool.lailin.xyz"
+
 //+kubebuilder:rbac:groups=nodes.lailin.xyz,resources=nodepools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=nodes.lailin.xyz,resources=nodepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=nodes.lailin.xyz,resources=nodepools/finalizers,verbs=update
@@ -54,7 +56,12 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// 获取资源
 	pool := &nodesv1.NodePool{}
 	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
-		return ctrl.Result{}, err
+		if client.IgnoreNotFound(err) != nil {
+			log.Info("Get NodePool error")
+			return ctrl.Result{}, err
+		}
+		log.Info("Get NodePool NotFound")
+		return ctrl.Result{}, nil
 	}
 
 	var nodes v1.NodeList
@@ -65,6 +72,20 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// 删除时间戳不为空 进入预删除逻辑
+	if !pool.DeletionTimestamp.IsZero() {
+		log.Info("Pre Delete Handler")
+		return ctrl.Result{}, r.nodeFinalizer(ctx, pool, nodes.Items)
+	}
+	// 删除时间戳为空说明现在不需要删除该数据，我们将 nodeFinalizer 加入到资源中
+	if !containsString(pool.Finalizers, nodeFinalizer) {
+		pool.Finalizers = append(pool.Finalizers, nodeFinalizer)
+		if err := r.Update(ctx, pool); err != nil {
+			log.Info("Update Finalizers Error")
+			return ctrl.Result{}, err
+		}
+	}
+
 	if len(nodes.Items) > 0 {
 		log.Info("find nodes, will merge data", "nodes", len(nodes.Items))
 		for _, node := range nodes.Items {
@@ -72,21 +93,29 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			//err := r.Patch(ctx, pool.Spec.ApplyNode(node), client.Merge)
 			err := r.Update(ctx, pool.Spec.ApplyNode(node))
 			if err != nil {
+				log.Info("Update Node Labels Error")
 				return ctrl.Result{}, err
 			}
 		}
 	}
 
-	var runtimeClass v1beta1.RuntimeClass
-	err = r.Get(ctx, client.ObjectKeyFromObject(pool.RuntimeClass()), &runtimeClass)
+	runtimeClass := &v1beta1.RuntimeClass{}
+	err = r.Get(ctx, client.ObjectKeyFromObject(pool.RuntimeClass()), runtimeClass)
 	if client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 如果不存在创建一个新的RuntimeClass
 	if runtimeClass.Name == "" {
-		err = r.Create(ctx, pool.RuntimeClass())
+		runtimeClass = pool.RuntimeClass()
+		err = ctrl.SetControllerReference(pool, runtimeClass, r.Scheme)
 		if err != nil {
+			log.Info("SetControllerReference error")
+			return ctrl.Result{}, err
+		}
+		err = r.Create(ctx, runtimeClass)
+		if err != nil {
+			log.Info("Create runtimeClass error")
 			return ctrl.Result{}, err
 		}
 	}
@@ -94,6 +123,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// RuntimeClass如果存在则更新
 	err = r.Patch(ctx, pool.RuntimeClass(), client.Merge)
 	if err != nil {
+		log.Info("Patch RuntimeClass Error")
 		return ctrl.Result{}, err
 	}
 
@@ -105,4 +135,41 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&nodesv1.NodePool{}).
 		Complete(r)
+}
+
+// 节点预删除逻辑
+func (r *NodePoolReconciler) nodeFinalizer(ctx context.Context, pool *nodesv1.NodePool, nodes []v1.Node) error {
+	for _, node := range nodes {
+		node := node
+		// 更新节点和污点信息
+		err := r.Update(ctx, pool.Spec.CleanNode(node))
+		if err != nil {
+			return err
+		}
+	}
+
+	// 删除预处理完毕, 移除nodeFinalizer
+	pool.Finalizers = removeString(pool.Finalizers, nodeFinalizer)
+	return r.Update(ctx, pool)
+}
+
+// 检查字符串切片是否包含某个字符串
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// 移除字符串切片中对应字符串
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
